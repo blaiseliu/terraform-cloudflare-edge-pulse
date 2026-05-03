@@ -27,6 +27,25 @@ app.get("/ingest", async (c) => {
   }
 })
 
+app.get("/articles", async (c) => {
+  try {
+    if (!schemaInitialized) {
+      await initSchema(c.env.DB)
+      schemaInitialized = true
+    }
+    const limit = Math.min(parseInt(c.req.query("limit") || "20", 10), 100)
+    const { results } = await c.env.DB
+      .prepare(
+        "SELECT title, summary_zh, url, source_name, published_at, ingested_at FROM articles ORDER BY ingested_at DESC LIMIT ?",
+      )
+      .bind(limit)
+      .all()
+    return c.json(results)
+  } catch (err) {
+    return c.json({ error: String(err) }, 500)
+  }
+})
+
 app.get("/health", async (c) => {
   try {
     if (!schemaInitialized) {
