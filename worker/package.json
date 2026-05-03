@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "eval": "npx tsx eval/eval.ts"
   },
   "dependencies": {
     "@extractus/feed-extractor": "^7.1.0",
@@ -13,6 +15,8 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250502.0",
+    "tsx": "^4.21.0",
+    "vitest": "^4.1.5",
     "wrangler": "^4.50.0"
   }
 }
