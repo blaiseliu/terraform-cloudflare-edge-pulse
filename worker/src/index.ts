@@ -458,11 +458,25 @@ function renderSourceList(sources) {
     return '<div class="source-row">' +
       '<span class="source-name">' + h(s.name) + '</span>' +
       '<span class="source-url">' + h(s.url) + '</span>' +
-      '<div class="toggle' + (s.enabled ? ' on' : '') + '" onclick="toggleSource(\'' + s.id + '\',' + s.enabled + ')" title="Enable/disable"></div>' +
-      '<button class="btn btn-danger btn-sm" onclick="deleteFeed(\'' + s.id + '\')">×</button>' +
+      '<div class="toggle' + (s.enabled ? ' on' : '') + '" data-action="toggle" data-id="' + h(s.id) + '" data-enabled="' + s.enabled + '" title="Enable/disable"></div>' +
+      '<button class="btn btn-danger btn-sm" data-action="delete" data-id="' + h(s.id) + '">×</button>' +
     '</div>'
   }).join("")
 }
+
+// Event delegation for source list actions (avoids template-literal escape bugs)
+document.getElementById("source-list").addEventListener("click", function(e) {
+  var target = e.target.closest("[data-action]")
+  if (!target) return
+  var action = target.getAttribute("data-action")
+  var id = target.getAttribute("data-id")
+  if (action === "toggle") {
+    var current = parseInt(target.getAttribute("data-enabled"), 10)
+    toggleSource(id, current)
+  } else if (action === "delete") {
+    deleteFeed(id)
+  }
+})
 
 async function addFeed() {
   var urlEl = document.getElementById("add-url")
