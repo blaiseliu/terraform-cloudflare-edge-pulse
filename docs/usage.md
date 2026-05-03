@@ -83,34 +83,49 @@ No manual trigger needed — the pipeline is self-maintaining.
 4. Check health again — count should increase if new articles published
 5. Reload the frontend to see new cards appear
 
-## Changing feeds
+## Managing feeds
 
-Edit `worker/src/sources.ts`:
+Feeds are stored in D1 and managed from the webapp or API — no redeploy needed.
 
-```ts
-import type { SourceConfig } from "./sources"
+**From the webapp**: Click the **Feeds** button in the toolbar to open the settings panel. Toggle feeds on/off, delete feeds, or add new ones with the URL + name form.
 
-export const SOURCES: SourceConfig[] = [
-  {
-    url: "https://simonwillison.net/atom/everything/",
-    name: "Simon Willison's Weblog",
-    type: "rss",
-  },
-  {
-    url: "https://hnrss.org/frontpage",
-    name: "Hacker News",
-    type: "rss",
-  },
-  // Add or remove feeds here
-]
-```
-
-Each source must have `url`, `name`, and `type` (currently `"rss"` only; `"hn"` type is planned for v1.1.0). Then rebuild and redeploy:
+**From the API**:
 
 ```bash
-cd worker
-npm run deploy
+# List all sources (enabled and disabled)
+curl https://edge-pulse.liujianqing.workers.dev/sources
+
+# Add a new source
+curl -X POST https://edge-pulse.liujianqing.workers.dev/sources \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/feed","name":"My Feed"}'
+
+# Toggle a source enabled/disabled
+curl -X PUT https://edge-pulse.liujianqing.workers.dev/sources/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":0}'
+
+# Delete a source
+curl -X DELETE https://edge-pulse.liujianqing.workers.dev/sources/<id>
 ```
+
+**`GET /sources`**
+
+Returns an array of source objects: `id`, `url`, `name`, `type`, `enabled` (0 or 1), `created_at`.
+
+**`POST /sources`**
+
+Creates a source. Requires `url` and `name` in the JSON body. Returns the created source with `201`. Returns `400` if `url` or `name` is missing.
+
+**`PUT /sources/:id`**
+
+Partial update. Send only the fields you want to change (`url`, `name`, `type`, `enabled`). Returns `{"ok":true}` or `404` if not found.
+
+**`DELETE /sources/:id`**
+
+Deletes a source. Returns `{"ok":true}` or `404` if not found.
+
+On first run, three default feeds are seeded automatically (Simon Willison, Hacker News, MIT Technology Review). You can delete or disable them at any time.
 
 ## Changing the AI model
 
@@ -163,7 +178,7 @@ The Worker isn't reachable at the workers.dev domain. Run `npx wrangler deploy` 
 Hit `/ingest` first — the schema is created lazily on the first ingest call (or any endpoint call, via ensureSchema).
 
 **Ingest returns per-source errors like "Feed Name: fetch failed"**
-One feed may be unreachable from Cloudflare's network. The error is non-fatal — other feeds still process. Check the feed URL in `worker/src/sources.ts`.
+One feed may be unreachable from Cloudflare's network. The error is non-fatal — other feeds still process. Check the feed URL via `GET /sources`.
 
 **Ingest returns "Dedup query failed"**
 D1 database is unreachable or not properly provisioned. Verify the D1 database exists in the Cloudflare dashboard and the binding is correctly configured in `wrangler.toml`.

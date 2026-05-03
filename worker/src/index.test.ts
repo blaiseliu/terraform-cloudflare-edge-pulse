@@ -12,6 +12,10 @@ describe("GET /", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -26,6 +30,10 @@ describe("GET /", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -63,6 +71,10 @@ describe("GET /articles", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -84,6 +96,10 @@ describe("GET /articles", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -106,6 +122,10 @@ describe("GET /articles", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -128,6 +148,10 @@ describe("GET /articles", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -147,6 +171,10 @@ describe("GET /articles", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -176,6 +204,10 @@ describe("GET /health", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -197,6 +229,10 @@ describe("GET /health", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -218,6 +254,10 @@ describe("GET /health", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 0, skipped: 0, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -247,6 +287,10 @@ describe("GET /ingest", () => {
     vi.doMock("./ingest", () => ({
       ensureSchema: async () => {},
       ingest: async () => ({ processed: 3, skipped: 1, errors: [] }),
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -271,6 +315,10 @@ describe("GET /ingest", () => {
       ingest: async () => {
         throw new Error("Pipeline crashed")
       },
+      getSources: async () => [],
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
     }))
 
     const { default: worker } = await import("./index")
@@ -285,6 +333,268 @@ describe("GET /ingest", () => {
     expect(res.status).toBe(500)
     const body = await res.json()
     expect(body.error).toContain("Pipeline crashed")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GET /sources
+// ---------------------------------------------------------------------------
+describe("GET /sources", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("returns JSON array of sources", async () => {
+    const sources = [
+      { id: "s1", url: "https://a.com/feed", name: "Feed A", type: "rss", enabled: 1, created_at: "2026-01-01" },
+      { id: "s2", url: "https://b.com/feed", name: "Feed B", type: "rss", enabled: 0, created_at: "2026-01-02" },
+    ]
+
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      getSources: async () => sources,
+      addSource: async () => ({}),
+      updateSource: async () => true,
+      deleteSource: async () => true,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources")
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toHaveLength(2)
+    expect(body[0].name).toBe("Feed A")
+    expect(body[1].enabled).toBe(0)
+  })
+
+  it("returns 500 on DB error", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      getSources: async () => { throw new Error("DB down") },
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources")
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toHaveProperty("error")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// POST /sources
+// ---------------------------------------------------------------------------
+describe("POST /sources", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("creates a source and returns 201", async () => {
+    const created = {
+      id: "new-id",
+      url: "https://new.com/feed",
+      name: "New Feed",
+      type: "rss",
+      enabled: 1,
+      created_at: "2026-05-03",
+    }
+
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      addSource: async () => created,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://new.com/feed", name: "New Feed" }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.id).toBe("new-id")
+    expect(body.name).toBe("New Feed")
+  })
+
+  it("returns 400 when url is missing", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      addSource: async () => ({}),
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "No URL" }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toContain("url")
+  })
+
+  it("returns 400 when name is missing", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      addSource: async () => ({}),
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://x.com/feed" }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toContain("name")
+  })
+
+  it("returns 500 on DB error", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      addSource: async () => { throw new Error("DB write failed") },
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://x.com/feed", name: "X" }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toHaveProperty("error")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PUT /sources/:id
+// ---------------------------------------------------------------------------
+describe("PUT /sources/:id", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("updates a source and returns ok", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      updateSource: async () => true,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/s1", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: 0 }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.ok).toBe(true)
+  })
+
+  it("returns 404 when source not found", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      updateSource: async () => false,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/nonexistent", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: 0 }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(404)
+  })
+
+  it("returns 500 on DB error", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      updateSource: async () => { throw new Error("DB write failed") },
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/s1", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: 0 }),
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(500)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DELETE /sources/:id
+// ---------------------------------------------------------------------------
+describe("DELETE /sources/:id", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("deletes a source and returns ok", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      deleteSource: async () => true,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/s1", {
+      method: "DELETE",
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.ok).toBe(true)
+  })
+
+  it("returns 404 when source not found", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      deleteSource: async () => false,
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/nonexistent", {
+      method: "DELETE",
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(404)
+  })
+
+  it("returns 500 on DB error", async () => {
+    vi.doMock("./ingest", () => ({
+      ensureSchema: async () => {},
+      deleteSource: async () => { throw new Error("DB write failed") },
+    }))
+
+    const { default: worker } = await import("./index")
+    const req = new Request("https://edge-pulse.workers.dev/sources/s1", {
+      method: "DELETE",
+    })
+    const res = await worker.fetch(req, { DB: mockDb() })
+
+    expect(res.status).toBe(500)
   })
 })
 

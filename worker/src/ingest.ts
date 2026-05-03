@@ -1,16 +1,21 @@
 import { extract } from "@extractus/feed-extractor"
-import type { SourceConfig } from "./sources"
-import { SOURCES } from "./sources"
 
 const SCHEMA_SQL = [
   "CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT UNIQUE NOT NULL, source_name TEXT NOT NULL, feed_url TEXT, summary_zh TEXT, published_at TEXT, ingested_at TEXT NOT NULL DEFAULT (datetime('now')))",
   "CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url)",
   "CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at)",
+  "CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'rss', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
 ]
 
 const MIGRATION_SQL = [
   "ALTER TABLE articles ADD COLUMN feed_url TEXT",
   "CREATE INDEX IF NOT EXISTS idx_articles_feed_url ON articles(feed_url)",
+]
+
+const DEFAULT_SOURCES = [
+  { url: "https://simonwillison.net/atom/everything/", name: "Simon Willison's Weblog", type: "rss" },
+  { url: "https://hnrss.org/frontpage", name: "Hacker News", type: "rss" },
+  { url: "https://www.technologyreview.com/feed/", name: "MIT Technology Review", type: "rss" },
 ]
 
 export interface Article {
@@ -27,6 +32,15 @@ export interface IngestResult {
   processed: number
   skipped: number
   errors: string[]
+}
+
+export interface SourceRow {
+  id: string
+  url: string
+  name: string
+  type: string
+  enabled: number
+  created_at: string
 }
 
 export async function sha256(text: string): Promise<string> {
@@ -51,15 +65,69 @@ export async function ensureSchema(db: D1Database): Promise<void> {
         await db.prepare(sql).run()
       }
       for (const sql of MIGRATION_SQL) {
-        try {
-          await db.prepare(sql).run()
-        } catch {
-          // Column already exists — ignore
-        }
+        try { await db.prepare(sql).run() } catch { /* column exists */ }
       }
+      await seedDefaultSources(db)
     })()
   }
   return schemaReady
+}
+
+async function seedDefaultSources(db: D1Database): Promise<void> {
+  const { results } = await db.prepare("SELECT COUNT(*) as count FROM sources").all()
+  if ((results[0] as any).count > 0) return
+
+  const stmts = DEFAULT_SOURCES.map((s) =>
+    db.prepare("INSERT OR IGNORE INTO sources (id, url, name, type) VALUES (?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), s.url, s.name, s.type),
+  )
+  await db.batch(stmts)
+}
+
+// ---------------------------------------------------------------------------
+// Sources CRUD
+// ---------------------------------------------------------------------------
+export async function getSources(db: D1Database): Promise<SourceRow[]> {
+  const { results } = await db.prepare("SELECT id, url, name, type, enabled, created_at FROM sources ORDER BY created_at ASC").all()
+  return results as unknown as SourceRow[]
+}
+
+export async function addSource(db: D1Database, input: { url: string; name: string; type?: string }): Promise<SourceRow> {
+  const id = crypto.randomUUID()
+  await db.prepare("INSERT INTO sources (id, url, name, type) VALUES (?, ?, ?, ?)")
+    .bind(id, input.url, input.name, input.type || "rss")
+    .run()
+  return { id, url: input.url, name: input.name, type: input.type || "rss", enabled: 1, created_at: new Date().toISOString() }
+}
+
+export async function updateSource(db: D1Database, id: string, updates: { url?: string; name?: string; type?: string; enabled?: number }): Promise<boolean> {
+  const sets: string[] = []
+  const vals: any[] = []
+
+  if (updates.url !== undefined) { sets.push("url = ?"); vals.push(updates.url) }
+  if (updates.name !== undefined) { sets.push("name = ?"); vals.push(updates.name) }
+  if (updates.type !== undefined) { sets.push("type = ?"); vals.push(updates.type) }
+  if (updates.enabled !== undefined) { sets.push("enabled = ?"); vals.push(updates.enabled) }
+
+  if (sets.length === 0) return false
+
+  vals.push(id)
+  const result = await db.prepare(`UPDATE sources SET ${sets.join(", ")} WHERE id = ?`).bind(...vals).run()
+  return (result.meta as any).changes > 0
+}
+
+export async function deleteSource(db: D1Database, id: string): Promise<boolean> {
+  const result = await db.prepare("DELETE FROM sources WHERE id = ?").bind(id).run()
+  return (result.meta as any).changes > 0
+}
+
+// ---------------------------------------------------------------------------
+// Feed fetching
+// ---------------------------------------------------------------------------
+interface SourceConfig {
+  url: string
+  name: string
+  type: string
 }
 
 async function fetchFeed(source: SourceConfig): Promise<Article[]> {
@@ -73,8 +141,7 @@ async function fetchFeed(source: SourceConfig): Promise<Article[]> {
   return (feed.entries || [])
     .map((entry) => {
       const raw = (entry as any).description || entry.summary || ""
-      const desc =
-        typeof raw === "string" ? raw : raw?.text || raw?.["#text"] || String(raw)
+      const desc = typeof raw === "string" ? raw : raw?.text || raw?.["#text"] || String(raw)
       return {
         id: "",
         title: entry.title || "Untitled",
@@ -107,10 +174,7 @@ export async function fetchAllFeeds(
   return { articles: results.flat(), errors }
 }
 
-export async function batchDedup(
-  db: D1Database,
-  articles: Article[],
-): Promise<Article[]> {
+export async function batchDedup(db: D1Database, articles: Article[]): Promise<Article[]> {
   if (articles.length === 0) return []
 
   const urls = articles.map((a) => a.url)
@@ -155,13 +219,7 @@ export async function summarizeAll(
 ): Promise<(Article & { summary: string | null })[]> {
   const results = await Promise.all(
     articles.map(async (article) => {
-      const summary = await summarize(
-        ai,
-        model,
-        article.title,
-        article.content,
-        maxChars,
-      )
+      const summary = await summarize(ai, model, article.title, article.content, maxChars)
       return { ...article, summary }
     }),
   )
@@ -176,7 +234,14 @@ export async function ingest(
 ): Promise<IngestResult> {
   const result: IngestResult = { processed: 0, skipped: 0, errors: [] }
 
-  const { articles: fetched, errors: fetchErrors } = await fetchAllFeeds(SOURCES)
+  const dbSources = await getSources(db)
+  const enabled = dbSources.filter((s) => s.enabled === 1)
+  if (enabled.length === 0) {
+    result.errors.push("No enabled sources configured")
+    return result
+  }
+
+  const { articles: fetched, errors: fetchErrors } = await fetchAllFeeds(enabled)
   result.errors.push(...fetchErrors)
 
   if (fetched.length === 0) {

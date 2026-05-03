@@ -40,7 +40,7 @@ Edit `worker/wrangler.toml` — set your account ID:
 account_id = "your-account-id-here"
 ```
 
-Optionally change the AI model or feed sources:
+Optionally change the AI model:
 
 ```toml
 [vars]
@@ -48,14 +48,7 @@ AI_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct"
 MAX_CONTENT_CHARS = "2000"
 ```
 
-To change which feeds are ingested, edit `worker/src/sources.ts`:
-
-```ts
-export const SOURCES: SourceConfig[] = [
-  { url: "https://your-feed.com/rss", name: "My Feed", type: "rss" },
-  // Add or remove feeds here
-]
-```
+Feed sources are managed from the webapp or API after deployment — no config file edits needed. Three default feeds (Simon Willison, Hacker News, MIT Technology Review) are seeded automatically on first run.
 
 ## Step 4 — Deploy the Worker
 
@@ -115,14 +108,31 @@ The frontend shows feed cards with Chinese summaries, source chips, and timestam
 
 ## Changing feeds later
 
-Edit `worker/src/sources.ts`, then redeploy:
+Feeds are stored in D1 and managed from the webapp or API — no redeploy needed.
+
+**From the webapp**: Click **Feeds** → toggle, delete, or add feeds using the settings panel.
+
+**From the API**:
 
 ```bash
-cd worker
-npx wrangler deploy
+# List sources
+curl https://edge-pulse.<your-subdomain>.workers.dev/sources
+
+# Add a source
+curl -X POST https://edge-pulse.<your-subdomain>.workers.dev/sources \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/feed","name":"My Feed"}'
+
+# Toggle enabled/disabled
+curl -X PUT https://edge-pulse.<your-subdomain>.workers.dev/sources/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":0}'
+
+# Delete a source
+curl -X DELETE https://edge-pulse.<your-subdomain>.workers.dev/sources/<id>
 ```
 
-No terraform changes needed — the Worker handles feed configuration.
+No terraform or wrangler changes needed — sources are stored in D1 and take effect on the next ingestion run.
 
 ## Changing the AI model
 

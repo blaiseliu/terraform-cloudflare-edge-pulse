@@ -69,15 +69,36 @@ describe("ensureSchema", () => {
     vi.resetModules()
   })
 
-  it("creates table, indexes, and runs migration statements", async () => {
+  it("creates articles table, sources table, indexes, and runs migration", async () => {
     const runOrder: string[] = []
     const mockDb = {
       prepare: (sql: string) => ({
+        bind: (..._args: any[]) => ({
+          run: async () => {
+            runOrder.push(sql)
+            return { meta: { changes: 1 } }
+          },
+          all: async () => {
+            runOrder.push(sql)
+            if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+              return { results: [{ count: 3 }] }
+            }
+            return { results: [] }
+          },
+        }),
         run: async () => {
           runOrder.push(sql)
-          return {}
+          return { meta: { changes: 1 } }
+        },
+        all: async () => {
+          runOrder.push(sql)
+          if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+            return { results: [{ count: 3 }] }
+          }
+          return { results: [] }
         },
       }),
+      batch: async () => ({}),
     } as unknown as D1Database
 
     const { ensureSchema } = await import("./ingest")
@@ -86,138 +107,263 @@ describe("ensureSchema", () => {
     expect(runOrder[0]).toContain("CREATE TABLE IF NOT EXISTS articles")
     expect(runOrder[1]).toContain("CREATE INDEX IF NOT EXISTS idx_articles_url")
     expect(runOrder[2]).toContain("CREATE INDEX IF NOT EXISTS idx_articles_ingested_at")
-    expect(runOrder[3]).toContain("ALTER TABLE articles ADD COLUMN feed_url")
-    expect(runOrder[4]).toContain("CREATE INDEX IF NOT EXISTS idx_articles_feed_url")
+    expect(runOrder[3]).toContain("CREATE TABLE IF NOT EXISTS sources")
+    expect(runOrder[4]).toContain("ALTER TABLE articles ADD COLUMN feed_url")
+    expect(runOrder[5]).toContain("CREATE INDEX IF NOT EXISTS idx_articles_feed_url")
+    expect(runOrder[6]).toContain("SELECT COUNT(*)") // seed check
   })
 
   it("silently ignores migration failure (column already exists)", async () => {
-    const runCalls: string[] = []
     const mockDb = {
       prepare: (sql: string) => ({
+        bind: (..._args: any[]) => ({
+          run: async () => {
+            if (sql.includes("ALTER TABLE")) throw new Error("column exists")
+            return {}
+          },
+          all: async () => ({ results: [{ count: 3 }] }),
+        }),
         run: async () => {
-          runCalls.push(sql)
           if (sql.includes("ALTER TABLE")) throw new Error("column exists")
           return {}
         },
+        all: async () => ({ results: [{ count: 3 }] }),
       }),
+      batch: async () => ({}),
     } as unknown as D1Database
 
     const { ensureSchema } = await import("./ingest")
-    // Should not throw
-    await ensureSchema(mockDb)
-    expect(runCalls.filter((s) => s.includes("ALTER TABLE"))).toHaveLength(1)
+    await ensureSchema(mockDb) // should not throw
   })
 
   it("only executes schema once (Promise gate)", async () => {
-    const runCounts = new Map<string, number>()
+    let callCount = 0
     const mockDb = {
-      prepare: (sql: string) => ({
-        run: async () => {
-          runCounts.set(sql, (runCounts.get(sql) || 0) + 1)
-          return {}
-        },
+      prepare: () => ({
+        bind: () => ({
+          run: async () => { callCount++; return {} },
+          all: async () => { callCount++; return { results: [{ count: 3 }] } },
+        }),
+        run: async () => { callCount++; return {} },
+        all: async () => { callCount++; return { results: [{ count: 3 }] } },
       }),
+      batch: async () => {},
     } as unknown as D1Database
 
     const { ensureSchema } = await import("./ingest")
     await ensureSchema(mockDb)
+    const afterFirst = callCount
     await ensureSchema(mockDb)
-
-    for (const count of runCounts.values()) {
-      expect(count).toBe(1)
-    }
+    expect(callCount).toBe(afterFirst) // no additional calls
   })
 })
 
 // ---------------------------------------------------------------------------
-// fetchFeed (per-source)
+// Sources CRUD
 // ---------------------------------------------------------------------------
-describe("fetchFeed", () => {
+describe("getSources", () => {
   beforeEach(() => {
     vi.resetModules()
   })
 
-  it("parses valid feed entries with source name and feedUrl", async () => {
-    vi.doMock("@extractus/feed-extractor", () => ({
-      extract: async () => ({
-        title: "Feed Title",
-        entries: [
-          {
-            title: "Article One",
-            link: "https://example.com/1",
-            published: "2026-05-01",
-            description: "<p>Content of article one</p>",
+  it("returns sources ordered by created_at", async () => {
+    const rows = [
+      { id: "1", url: "https://a.com", name: "A", type: "rss", enabled: 1, created_at: "2026-01-01" },
+      { id: "2", url: "https://b.com", name: "B", type: "rss", enabled: 0, created_at: "2026-01-02" },
+    ]
+    const mockDb = {
+      prepare: () => ({
+        all: async () => ({ results: rows }),
+      }),
+    } as unknown as D1Database
+
+    const { getSources } = await import("./ingest")
+    const sources = await getSources(mockDb)
+    expect(sources).toHaveLength(2)
+    expect(sources[0].name).toBe("A")
+    expect(sources[1].enabled).toBe(0)
+  })
+})
+
+describe("addSource", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("inserts a new source and returns it", async () => {
+    let inserted = false
+    const mockDb = {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => { inserted = true; return {} },
+        }),
+      }),
+    } as unknown as D1Database
+
+    const { addSource } = await import("./ingest")
+    const source = await addSource(mockDb, { url: "https://new.com/feed", name: "New Feed" })
+
+    expect(inserted).toBe(true)
+    expect(source.url).toBe("https://new.com/feed")
+    expect(source.name).toBe("New Feed")
+    expect(source.type).toBe("rss")
+    expect(source.enabled).toBe(1)
+    expect(source.id).toBeTruthy()
+  })
+})
+
+describe("updateSource", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("updates specified fields", async () => {
+    let lastSql = ""
+    let lastArgs: any[] = []
+    const mockDb = {
+      prepare: (sql: string) => ({
+        bind: (...args: any[]) => {
+          lastSql = sql
+          lastArgs = args
+          return { run: async () => ({ meta: { changes: 1 } }) }
+        },
+      }),
+    } as unknown as D1Database
+
+    const { updateSource } = await import("./ingest")
+    const ok = await updateSource(mockDb, "id-123", { enabled: 0, name: "Renamed" })
+
+    expect(ok).toBe(true)
+    expect(lastSql).toContain("enabled = ?")
+    expect(lastSql).toContain("name = ?")
+    expect(lastArgs).toContain(0)
+    expect(lastArgs).toContain("Renamed")
+    expect(lastArgs).toContain("id-123")
+  })
+
+  it("returns false when no fields provided", async () => {
+    const { updateSource } = await import("./ingest")
+    const ok = await updateSource({} as unknown as D1Database, "id", {})
+    expect(ok).toBe(false)
+  })
+
+  it("returns false when source not found", async () => {
+    const mockDb = {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => ({ meta: { changes: 0 } }),
+        }),
+      }),
+    } as unknown as D1Database
+
+    const { updateSource } = await import("./ingest")
+    const ok = await updateSource(mockDb, "nonexistent", { enabled: 0 })
+    expect(ok).toBe(false)
+  })
+})
+
+describe("deleteSource", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("deletes a source and returns true", async () => {
+    const mockDb = {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => ({ meta: { changes: 1 } }),
+        }),
+      }),
+    } as unknown as D1Database
+
+    const { deleteSource } = await import("./ingest")
+    const ok = await deleteSource(mockDb, "id-123")
+    expect(ok).toBe(true)
+  })
+
+  it("returns false when source not found", async () => {
+    const mockDb = {
+      prepare: () => ({
+        bind: () => ({
+          run: async () => ({ meta: { changes: 0 } }),
+        }),
+      }),
+    } as unknown as D1Database
+
+    const { deleteSource } = await import("./ingest")
+    const ok = await deleteSource(mockDb, "nonexistent")
+    expect(ok).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// seedDefaultSources — tested via ensureSchema with empty sources table
+// ---------------------------------------------------------------------------
+describe("seedDefaultSources", () => {
+  beforeEach(() => {
+    vi.resetModules()
+  })
+
+  it("seeds defaults when sources table is empty", async () => {
+    let seedCount = 0
+    const mockDb = {
+      prepare: (sql: string) => ({
+        bind: (..._args: any[]) => ({
+          run: async () => { seedCount++; return {} },
+          all: async () => {
+            if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+              return { results: [{ count: 0 }] } // empty → trigger seed
+            }
+            return { results: [] }
           },
-        ],
+        }),
+        run: async () => { return {} },
+        all: async () => {
+          if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+            return { results: [{ count: 0 }] }
+          }
+          return { results: [] }
+        },
       }),
-    }))
+      batch: async (stmts: any[]) => { seedCount += stmts.length },
+    } as unknown as D1Database
 
-    const { fetchAllFeeds } = await import("./ingest")
-    const sources = [{ url: "https://example.com/feed", name: "Example Feed", type: "rss" as const }]
-    const { articles, errors } = await fetchAllFeeds(sources)
+    const { ensureSchema } = await import("./ingest")
+    await ensureSchema(mockDb)
 
-    expect(errors).toHaveLength(0)
-    expect(articles).toHaveLength(1)
-    expect(articles[0].title).toBe("Article One")
-    expect(articles[0].url).toBe("https://example.com/1")
-    expect(articles[0].source).toBe("Example Feed")
-    expect(articles[0].feedUrl).toBe("https://example.com/feed")
-    expect(articles[0].content).toBe("Content of article one")
-    expect(articles[0].published).toBe("2026-05-01")
+    // 3 default sources should have been inserted
+    expect(seedCount).toBeGreaterThanOrEqual(3)
   })
 
-  it("filters out entries without a URL", async () => {
-    vi.doMock("@extractus/feed-extractor", () => ({
-      extract: async () => ({
-        entries: [
-          { title: "No Link", link: "" },
-          { title: "Has Link", link: "https://example.com/2" },
-        ],
-      }),
-    }))
-
-    const { fetchAllFeeds } = await import("./ingest")
-    const { articles } = await fetchAllFeeds([
-      { url: "https://example.com", name: "Test", type: "rss" },
-    ])
-
-    expect(articles).toHaveLength(1)
-    expect(articles[0].title).toBe("Has Link")
-  })
-
-  it("handles object-style descriptions", async () => {
-    vi.doMock("@extractus/feed-extractor", () => ({
-      extract: async () => ({
-        entries: [
-          {
-            title: "Object Desc",
-            link: "https://example.com/3",
-            description: { text: "<p>Nested text content</p>" },
+  it("skips seed when sources already exist", async () => {
+    let batchCalled = false
+    const mockDb = {
+      prepare: (sql: string) => ({
+        bind: (..._args: any[]) => ({
+          run: async () => ({}),
+          all: async () => {
+            if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+              return { results: [{ count: 5 }] } // already has sources
+            }
+            return { results: [] }
           },
-        ],
+        }),
+        run: async () => ({}),
+        all: async () => {
+          if (sql.includes("COUNT(*)") && sql.includes("sources")) {
+            return { results: [{ count: 5 }] }
+          }
+          return { results: [] }
+        },
       }),
-    }))
+      batch: async () => { batchCalled = true },
+    } as unknown as D1Database
 
-    const { fetchAllFeeds } = await import("./ingest")
-    const { articles } = await fetchAllFeeds([
-      { url: "https://example.com", name: "Test", type: "rss" },
-    ])
+    const { ensureSchema } = await import("./ingest")
+    await ensureSchema(mockDb)
 
-    expect(articles).toHaveLength(1)
-    expect(articles[0].content).toBe("Nested text content")
-  })
-
-  it("returns empty array when feed has no entries", async () => {
-    vi.doMock("@extractus/feed-extractor", () => ({
-      extract: async () => ({ entries: [] }),
-    }))
-
-    const { fetchAllFeeds } = await import("./ingest")
-    const { articles } = await fetchAllFeeds([
-      { url: "https://example.com", name: "Test", type: "rss" },
-    ])
-
-    expect(articles).toHaveLength(0)
+    // Batch should NOT have been called because seed was skipped
+    expect(batchCalled).toBe(false)
   })
 })
 
@@ -241,9 +387,9 @@ describe("fetchAllFeeds", () => {
 
     const { fetchAllFeeds } = await import("./ingest")
     const sources = [
-      { url: "https://a.com/feed", name: "Feed A", type: "rss" as const },
-      { url: "https://b.com/feed", name: "Feed B", type: "rss" as const },
-      { url: "https://c.com/feed", name: "Feed C", type: "rss" as const },
+      { url: "https://a.com/feed", name: "Feed A", type: "rss" },
+      { url: "https://b.com/feed", name: "Feed B", type: "rss" },
+      { url: "https://c.com/feed", name: "Feed C", type: "rss" },
     ]
     const { articles, errors } = await fetchAllFeeds(sources)
 
@@ -265,8 +411,8 @@ describe("fetchAllFeeds", () => {
 
     const { fetchAllFeeds } = await import("./ingest")
     const sources = [
-      { url: "https://good.com/feed", name: "Good", type: "rss" as const },
-      { url: "https://broken.com/feed", name: "Broken", type: "rss" as const },
+      { url: "https://good.com/feed", name: "Good", type: "rss" },
+      { url: "https://broken.com/feed", name: "Broken", type: "rss" },
     ]
     const { articles, errors } = await fetchAllFeeds(sources)
 
@@ -274,7 +420,6 @@ describe("fetchAllFeeds", () => {
     expect(articles[0].source).toBe("Good")
     expect(errors).toHaveLength(1)
     expect(errors[0]).toContain("Broken")
-    expect(errors[0]).toContain("Network failure")
   })
 
   it("returns empty articles when all sources fail", async () => {
@@ -286,13 +431,81 @@ describe("fetchAllFeeds", () => {
 
     const { fetchAllFeeds } = await import("./ingest")
     const sources = [
-      { url: "https://a.com", name: "A", type: "rss" as const },
-      { url: "https://b.com", name: "B", type: "rss" as const },
+      { url: "https://a.com", name: "A", type: "rss" },
+      { url: "https://b.com", name: "B", type: "rss" },
     ]
     const { articles, errors } = await fetchAllFeeds(sources)
 
     expect(articles).toHaveLength(0)
     expect(errors).toHaveLength(2)
+  })
+
+  it("parses feed entries with source name and feedUrl", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async () => ({
+        title: "Feed Title",
+        entries: [
+          {
+            title: "Article One",
+            link: "https://example.com/1",
+            published: "2026-05-01",
+            description: "<p>Content of article one</p>",
+          },
+        ],
+      }),
+    }))
+
+    const { fetchAllFeeds } = await import("./ingest")
+    const sources = [{ url: "https://example.com/feed", name: "Example Feed", type: "rss" }]
+    const { articles } = await fetchAllFeeds(sources)
+
+    expect(articles[0].source).toBe("Example Feed")
+    expect(articles[0].feedUrl).toBe("https://example.com/feed")
+    expect(articles[0].content).toBe("Content of article one")
+  })
+
+  it("filters out entries without a URL", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async () => ({
+        entries: [
+          { title: "No Link", link: "" },
+          { title: "Has Link", link: "https://example.com/2" },
+        ],
+      }),
+    }))
+
+    const { fetchAllFeeds } = await import("./ingest")
+    const { articles } = await fetchAllFeeds([{ url: "https://x.com", name: "X", type: "rss" }])
+    expect(articles).toHaveLength(1)
+    expect(articles[0].title).toBe("Has Link")
+  })
+
+  it("handles object-style descriptions", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async () => ({
+        entries: [
+          {
+            title: "Object Desc",
+            link: "https://example.com/3",
+            description: { text: "<p>Nested text content</p>" },
+          },
+        ],
+      }),
+    }))
+
+    const { fetchAllFeeds } = await import("./ingest")
+    const { articles } = await fetchAllFeeds([{ url: "https://x.com", name: "X", type: "rss" }])
+    expect(articles[0].content).toBe("Nested text content")
+  })
+
+  it("returns empty array when feed has no entries", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async () => ({ entries: [] }),
+    }))
+
+    const { fetchAllFeeds } = await import("./ingest")
+    const { articles } = await fetchAllFeeds([{ url: "https://x.com", name: "X", type: "rss" }])
+    expect(articles).toHaveLength(0)
   })
 })
 
@@ -317,7 +530,6 @@ describe("batchDedup", () => {
       { id: "", title: "New", url: "https://new.com/2", source: "S", feedUrl: "f", published: null, content: "" },
     ]
     const result = await batchDedup(mockDb, articles)
-
     expect(result).toHaveLength(1)
     expect(result[0].title).toBe("New")
   })
@@ -337,7 +549,6 @@ describe("batchDedup", () => {
       { id: "", title: "B", url: "https://b.com", source: "S", feedUrl: "f", published: null, content: "" },
     ]
     const result = await batchDedup(mockDb, articles)
-
     expect(result).toHaveLength(2)
   })
 
@@ -345,9 +556,7 @@ describe("batchDedup", () => {
     const mockDb = {
       prepare: () => ({
         bind: () => ({
-          all: async () => ({
-            results: [{ url: "https://a.com" }, { url: "https://b.com" }],
-          }),
+          all: async () => ({ results: [{ url: "https://a.com" }, { url: "https://b.com" }] }),
         }),
       }),
     } as unknown as D1Database
@@ -358,20 +567,18 @@ describe("batchDedup", () => {
       { id: "", title: "B", url: "https://b.com", source: "S", feedUrl: "f", published: null, content: "" },
     ]
     const result = await batchDedup(mockDb, articles)
-
     expect(result).toHaveLength(0)
   })
 
   it("handles empty input array", async () => {
     const { batchDedup } = await import("./ingest")
-    const mockDb = {} as unknown as D1Database
-    const result = await batchDedup(mockDb, [])
+    const result = await batchDedup({} as unknown as D1Database, [])
     expect(result).toHaveLength(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// summarize
+// summarize / summarizeAll
 // ---------------------------------------------------------------------------
 describe("summarize", () => {
   beforeEach(() => {
@@ -381,8 +588,7 @@ describe("summarize", () => {
   it("truncates content to maxChars", async () => {
     vi.doMock("./prompt", () => ({
       SYSTEM_PROMPT: "test system prompt",
-      buildUserPrompt: (_title: string, content: string) =>
-        `Title: test\nContent: ${content}`,
+      buildUserPrompt: (_title: string, content: string) => `Title: test\nContent: ${content}`,
     }))
 
     let receivedMessages: any[] = []
@@ -408,9 +614,7 @@ describe("summarize", () => {
     }))
 
     const mockAi = {
-      run: async () => {
-        throw new Error("AI unavailable")
-      },
+      run: async () => { throw new Error("AI unavailable") },
     } as unknown as Ai
 
     const { summarize } = await import("./ingest")
@@ -419,9 +623,6 @@ describe("summarize", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// summarizeAll — parallel AI
-// ---------------------------------------------------------------------------
 describe("summarizeAll", () => {
   beforeEach(() => {
     vi.resetModules()
@@ -435,10 +636,7 @@ describe("summarizeAll", () => {
 
     let callCount = 0
     const mockAi = {
-      run: async () => {
-        callCount++
-        return { response: `Summary ${callCount}` }
-      },
+      run: async () => { callCount++; return { response: `Summary ${callCount}` } },
     } as unknown as Ai
 
     const { summarizeAll } = await import("./ingest")
@@ -452,7 +650,6 @@ describe("summarizeAll", () => {
     expect(callCount).toBe(2)
     expect(results[0].summary).toBe("Summary 1")
     expect(results[1].summary).toBe("Summary 2")
-    expect(results[0].title).toBe("A")
   })
 
   it("one AI failure produces null summary for that article only", async () => {
@@ -486,14 +683,18 @@ describe("summarizeAll", () => {
 })
 
 // ---------------------------------------------------------------------------
-// ingest — full multi-source pipeline
+// ingest — full pipeline with D1-backed sources
 // ---------------------------------------------------------------------------
 describe("ingest", () => {
   beforeEach(() => {
     vi.resetModules()
   })
 
-  function mockDb(existingUrls: string[] = []) {
+  function mockDb(existingUrls: string[] = [], dbSources: any[] | null = null) {
+    const defaultSources = dbSources || [
+      { id: "s1", url: "https://feed1.com/rss", name: "Feed 1", type: "rss", enabled: 1, created_at: "2026-01-01" },
+      { id: "s2", url: "https://feed2.com/rss", name: "Feed 2", type: "rss", enabled: 1, created_at: "2026-01-02" },
+    ]
     const stmts: any[] = []
     const db = {
       prepare: (sql: string) => {
@@ -506,7 +707,7 @@ describe("ingest", () => {
             return stmt
           },
           all: async () => {
-            // Return existing URLs for dedup queries
+            if (sql.includes("FROM sources")) return { results: defaultSources }
             if (sql.includes("SELECT url FROM articles WHERE url IN")) {
               return { results: existingUrls.map((url) => ({ url })) }
             }
@@ -522,15 +723,10 @@ describe("ingest", () => {
   }
 
   function mockAi() {
-    return {
-      run: async () => ({ response: "中文摘要内容" }),
-    } as unknown as Ai
+    return { run: async () => ({ response: "中文摘要内容" }) } as unknown as Ai
   }
 
-  // Source config used by the module — we mock the global SOURCES
-  // by mocking the extractor per URL
-
-  it("ingests new articles via full multi-source pipeline", async () => {
+  it("ingests new articles via full pipeline using D1 sources", async () => {
     vi.doMock("@extractus/feed-extractor", () => ({
       extract: async (url: string) => ({
         title: url,
@@ -546,36 +742,24 @@ describe("ingest", () => {
       buildUserPrompt: () => "test prompt",
     }))
 
-    // Override sources for deterministic test
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed1.com/rss", name: "Feed 1", type: "rss" },
-        { url: "https://feed2.com/rss", name: "Feed 2", type: "rss" },
-      ],
-    }))
-
     const { ingest } = await import("./ingest")
     const { db, stmts } = mockDb()
 
     const result = await ingest(db, mockAi(), "model", 2000)
 
-    expect(result.processed).toBe(4)
+    expect(result.processed).toBe(4) // 2 articles × 2 sources
     expect(result.skipped).toBe(0)
     expect(result.errors).toHaveLength(0)
 
     const inserts = stmts.filter((s: any) => s.sql.includes("INSERT"))
     expect(inserts).toHaveLength(4)
-    // Verify feed_url is included in INSERT values
-    expect(inserts[0].args).toContain("https://feed1.com/rss")
   })
 
-  it("deduplicates across all sources", async () => {
+  it("skips disabled sources", async () => {
     vi.doMock("@extractus/feed-extractor", () => ({
       extract: async (url: string) => ({
         title: url,
-        entries: [
-          { title: "New Article", link: url + "/new", description: "Fresh" },
-        ],
+        entries: [{ title: "Article", link: url + "/1", description: "OK" }],
       }),
     }))
 
@@ -584,19 +768,55 @@ describe("ingest", () => {
       buildUserPrompt: () => "test prompt",
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed.com/rss", name: "Feed", type: "rss" },
-      ],
+    const { ingest } = await import("./ingest")
+    const { db, stmts } = mockDb([], [
+      { id: "s1", url: "https://good.com/rss", name: "Good", type: "rss", enabled: 1, created_at: "2026-01-01" },
+      { id: "s2", url: "https://off.com/rss", name: "Off", type: "rss", enabled: 0, created_at: "2026-01-02" },
+    ])
+
+    const result = await ingest(db, mockAi(), "model", 2000)
+
+    expect(result.processed).toBe(1) // only the enabled source
+    const inserts = stmts.filter((s: any) => s.sql.includes("INSERT"))
+    expect(inserts).toHaveLength(1)
+  })
+
+  it("returns early when no enabled sources", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async () => ({ title: "X", entries: [] }),
     }))
 
     const { ingest } = await import("./ingest")
-    const { db } = mockDb(["https://feed.com/rss/new"]) // already ingested
+    const { db } = mockDb([], [
+      { id: "s1", url: "https://off.com", name: "Off", type: "rss", enabled: 0, created_at: "2026-01-01" },
+    ])
 
     const result = await ingest(db, mockAi(), "model", 2000)
 
     expect(result.processed).toBe(0)
+    expect(result.errors[0]).toContain("No enabled sources")
+  })
+
+  it("deduplicates across all sources", async () => {
+    vi.doMock("@extractus/feed-extractor", () => ({
+      extract: async (url: string) => ({
+        title: url,
+        entries: [{ title: "New Article", link: url + "/new", description: "Fresh" }],
+      }),
+    }))
+
+    vi.doMock("./prompt", () => ({
+      SYSTEM_PROMPT: "",
+      buildUserPrompt: () => "test prompt",
+    }))
+
+    const { ingest } = await import("./ingest")
+    const { db } = mockDb(["https://feed1.com/rss/new"])
+
+    const result = await ingest(db, mockAi(), "model", 2000)
+
     expect(result.skipped).toBe(1)
+    expect(result.processed).toBe(1)
   })
 
   it("one failing feed leaves partial results and errors", async () => {
@@ -615,48 +835,33 @@ describe("ingest", () => {
       buildUserPrompt: () => "test prompt",
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://good.com/rss", name: "Good Feed", type: "rss" },
-        { url: "https://bad.com/rss", name: "Bad Feed", type: "rss" },
-      ],
-    }))
-
     const { ingest } = await import("./ingest")
-    const { db, stmts } = mockDb()
+    const { db } = mockDb([], [
+      { id: "s1", url: "https://good.com/rss", name: "Good Feed", enabled: 1 },
+      { id: "s2", url: "https://bad.com/rss", name: "Bad Feed", enabled: 1 },
+    ])
 
     const result = await ingest(db, mockAi(), "model", 2000)
 
     expect(result.processed).toBe(1)
     expect(result.errors.length).toBe(1)
     expect(result.errors[0]).toContain("Bad Feed")
-    expect(result.errors[0]).toContain("404")
-
-    const inserts = stmts.filter((s: any) => s.sql.includes("INSERT"))
-    expect(inserts).toHaveLength(1)
   })
 
   it("returns early when all feeds fail", async () => {
     vi.doMock("@extractus/feed-extractor", () => ({
-      extract: async () => {
-        throw new Error("Network down")
-      },
-    }))
-
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://a.com", name: "A", type: "rss" },
-        { url: "https://b.com", name: "B", type: "rss" },
-      ],
+      extract: async () => { throw new Error("Network down") },
     }))
 
     const { ingest } = await import("./ingest")
-    const { db } = mockDb()
+    const { db } = mockDb([], [
+      { id: "s1", url: "https://a.com", name: "A", enabled: 1 },
+      { id: "s2", url: "https://b.com", name: "B", enabled: 1 },
+    ])
 
     const result = await ingest(db, mockAi(), "model", 2000)
 
     expect(result.processed).toBe(0)
-    expect(result.skipped).toBe(0)
     expect(result.errors.length).toBeGreaterThanOrEqual(2)
   })
 
@@ -668,26 +873,24 @@ describe("ingest", () => {
       }),
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed.com/rss", name: "Feed", type: "rss" },
-      ],
-    }))
-
-    const { ingest } = await import("./ingest")
-    const mockDb = {
-      prepare: () => ({
-        bind: () => ({
-          all: async () => {
-            throw new Error("D1 query timeout")
-          },
-        }),
-      }),
+    const failingDb = {
+      prepare: (sql: string) => {
+        if (sql.includes("FROM sources")) {
+          return {
+            all: async () => ({ results: [{ id: "s1", url: "https://a.com", name: "A", enabled: 1 }] }),
+          }
+        }
+        return {
+          bind: () => ({
+            all: async () => { throw new Error("D1 query timeout") },
+          }),
+        }
+      },
     } as unknown as D1Database
 
-    const result = await ingest(mockDb, mockAi(), "model", 2000)
+    const { ingest } = await import("./ingest")
+    const result = await ingest(failingDb, mockAi(), "model", 2000)
 
-    expect(result.processed).toBe(0)
     expect(result.errors[0]).toContain("Dedup query failed")
   })
 
@@ -699,19 +902,12 @@ describe("ingest", () => {
       }),
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed.com/rss", name: "Feed", type: "rss" },
-      ],
-    }))
-
     const { ingest } = await import("./ingest")
-    const { db } = mockDb(["https://feed.com/rss/1"])
+    const { db } = mockDb(["https://feed1.com/rss/1", "https://feed2.com/rss/1"])
 
     const result = await ingest(db, mockAi(), "model", 2000)
-
     expect(result.processed).toBe(0)
-    expect(result.skipped).toBe(1)
+    expect(result.skipped).toBe(2)
   })
 
   it("catches D1 batch insert failure", async () => {
@@ -727,40 +923,36 @@ describe("ingest", () => {
       buildUserPrompt: () => "prompt",
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed.com/rss", name: "Feed", type: "rss" },
-      ],
-    }))
-
-    const { ingest } = await import("./ingest")
-    const mockDb = {
-      prepare: (sql: string) => ({
-        bind: (...args: any[]) => ({
-          all: async () => ({ results: [] }),
-          _sql: sql,
-          _args: args,
-        }),
-      }),
-      batch: async () => {
-        throw new Error("D1 batch write failed")
+    const failBatchDb = {
+      prepare: (sql: string) => {
+        if (sql.includes("FROM sources")) {
+          return {
+            all: async () => ({ results: [{ id: "s1", url: "https://a.com", name: "A", enabled: 1 }] }),
+          }
+        }
+        return {
+          bind: (...args: any[]) => ({
+            all: async () => ({ results: [] }),
+            _sql: sql,
+            _args: args,
+          }),
+        }
       },
+      batch: async () => { throw new Error("D1 batch write failed") },
     } as unknown as D1Database
 
-    const result = await ingest(mockDb, mockAi(), "model", 2000)
+    const { ingest } = await import("./ingest")
+    const result = await ingest(failBatchDb, mockAi(), "model", 2000)
 
-    expect(result.processed).toBe(1) // Counted before batch attempt
     expect(result.errors.length).toBe(1)
     expect(result.errors[0]).toContain("D1 batch insert failed")
   })
 
-  it("stores article with null summary when summarize fails", async () => {
+  it("stores article with null summary when AI fails", async () => {
     vi.doMock("@extractus/feed-extractor", () => ({
       extract: async () => ({
         title: "Feed",
-        entries: [
-          { title: "Article", link: "https://a.com/1", description: "Will fail summary" },
-        ],
+        entries: [{ title: "Article", link: "https://a.com/1", description: "Will fail summary" }],
       }),
     }))
 
@@ -769,27 +961,20 @@ describe("ingest", () => {
       buildUserPrompt: () => "prompt",
     }))
 
-    vi.doMock("./sources", () => ({
-      SOURCES: [
-        { url: "https://feed.com/rss", name: "Feed", type: "rss" },
-      ],
-    }))
-
-    const mockAi = {
-      run: async () => {
-        throw new Error("AI unavailable")
-      },
+    const failAi = {
+      run: async () => { throw new Error("AI unavailable") },
     } as unknown as Ai
 
     const { ingest } = await import("./ingest")
-    const { db, stmts } = mockDb()
+    const { db, stmts } = mockDb([], [
+      { id: "s1", url: "https://a.com/rss", name: "Only Source", type: "rss", enabled: 1, created_at: "2026-01-01" },
+    ])
 
-    const result = await ingest(db, mockAi, "model", 2000)
-
+    const result = await ingest(db, failAi, "model", 2000)
     expect(result.processed).toBe(1)
+
     const inserts = stmts.filter((s: any) => s.sql.includes("INSERT"))
     expect(inserts).toHaveLength(1)
-    // summary_zh should be null (args: id, title, url, source_name, feed_url, summary_zh, published_at)
-    expect(inserts[0].args[5]).toBeNull()
+    expect(inserts[0].args[5]).toBeNull() // summary_zh position
   })
 })

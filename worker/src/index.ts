@@ -1,5 +1,5 @@
 import { Hono } from "hono"
-import { ingest, ensureSchema } from "./ingest"
+import { ingest, ensureSchema, getSources, addSource, updateSource, deleteSource } from "./ingest"
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -49,6 +49,58 @@ app.get("/health", async (c) => {
   }
 })
 
+// ---------------------------------------------------------------------------
+// Sources CRUD
+// ---------------------------------------------------------------------------
+app.get("/sources", async (c) => {
+  try {
+    await ensureSchema(c.env.DB)
+    const sources = await getSources(c.env.DB)
+    return c.json(sources)
+  } catch (err) {
+    return c.json({ error: String(err) }, 500)
+  }
+})
+
+app.post("/sources", async (c) => {
+  try {
+    await ensureSchema(c.env.DB)
+    const body = await c.req.json()
+    if (!body.url || !body.name) {
+      return c.json({ error: "url and name are required" }, 400)
+    }
+    const source = await addSource(c.env.DB, body)
+    return c.json(source, 201)
+  } catch (err) {
+    return c.json({ error: String(err) }, 500)
+  }
+})
+
+app.put("/sources/:id", async (c) => {
+  try {
+    await ensureSchema(c.env.DB)
+    const id = c.req.param("id")
+    const body = await c.req.json()
+    const ok = await updateSource(c.env.DB, id, body)
+    if (!ok) return c.json({ error: "source not found" }, 404)
+    return c.json({ ok: true })
+  } catch (err) {
+    return c.json({ error: String(err) }, 500)
+  }
+})
+
+app.delete("/sources/:id", async (c) => {
+  try {
+    await ensureSchema(c.env.DB)
+    const id = c.req.param("id")
+    const ok = await deleteSource(c.env.DB, id)
+    if (!ok) return c.json({ error: "source not found" }, 404)
+    return c.json({ ok: true })
+  } catch (err) {
+    return c.json({ error: String(err) }, 500)
+  }
+})
+
 app.get("/", async (c) => {
   return c.html(FRONTEND_HTML)
 })
@@ -91,7 +143,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     flex-wrap: wrap;
     gap: 8px;
   }
-  .toolbar button {
+  .toolbar button, .btn {
     background: #1a1a1a;
     color: #fff;
     border: none;
@@ -101,8 +153,17 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     cursor: pointer;
     font-family: inherit;
   }
-  .toolbar button:hover { background: #333; }
-  .toolbar button:disabled { opacity: 0.5; cursor: default; }
+  .toolbar button:hover, .btn:hover { background: #333; }
+  .toolbar button:disabled, .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn-ghost {
+    background: none;
+    color: #1a1a1a;
+    border: 1px solid #ccc;
+  }
+  .btn-ghost:hover { background: #f0f0f0; }
+  .btn-danger { background: #c00; }
+  .btn-danger:hover { background: #a00; }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
 
   .card {
     background: #fff;
@@ -135,10 +196,6 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     color: #fff;
     white-space: nowrap;
   }
-  .chip-simon     { background: #e17055; }
-  .chip-hacker    { background: #ff6600; }
-  .chip-mit       { background: #c41e3a; }
-  .chip-default   { background: #636e72; }
 
   .skeleton { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 12px; border: 1px solid #e8e8e8; }
   .skeleton .line {
@@ -187,6 +244,49 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     padding: 0 4px;
   }
 
+  /* Settings panel */
+  .settings-panel {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+    display: none;
+  }
+  .settings-panel.visible { display: block; }
+  .settings-panel h3 { font-size: 15px; margin-bottom: 12px; color: #333; }
+  .source-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid #f0f0f0;
+    flex-wrap: wrap;
+  }
+  .source-row:last-child { border-bottom: none; }
+  .source-row .source-name { flex: 1; min-width: 120px; font-size: 14px; }
+  .source-row .source-url { font-size: 12px; color: #888; flex: 2; min-width: 160px; word-break: break-all; }
+  .toggle {
+    width: 40px; height: 22px; background: #ccc; border-radius: 11px;
+    cursor: pointer; position: relative; transition: background 0.2s; flex-shrink: 0;
+  }
+  .toggle.on { background: #00b894; }
+  .toggle::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 18px; height: 18px; background: #fff; border-radius: 50%; transition: left 0.2s;
+  }
+  .toggle.on::after { left: 20px; }
+
+  .add-form {
+    display: flex; gap: 8px; margin-top: 16px; padding-top: 16px;
+    border-top: 1px solid #e0e0e0; flex-wrap: wrap;
+  }
+  .add-form input {
+    padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px;
+    font-size: 13px; font-family: inherit; flex: 1; min-width: 120px;
+  }
+  .add-form input:focus { outline: none; border-color: #666; }
+
   footer {
     text-align: center;
     padding: 32px 0;
@@ -204,12 +304,25 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   <div class="toolbar">
     <span id="article-count" style="font-size:13px;color:#888;"></span>
-    <button id="refresh-btn" onclick="loadArticles()">Refresh</button>
+    <div style="display:flex;gap:8px;">
+      <button class="btn-ghost" id="settings-btn" onclick="toggleSettings()">Feeds</button>
+      <button id="refresh-btn" onclick="loadArticles()">Refresh</button>
+    </div>
   </div>
 
   <div id="error-banner" class="error-banner" style="display:none;">
     <span id="error-msg"></span>
     <button onclick="dismissError()">×</button>
+  </div>
+
+  <div id="settings-panel" class="settings-panel">
+    <h3>Feed Sources</h3>
+    <div id="source-list"></div>
+    <div class="add-form">
+      <input type="text" id="add-url" placeholder="Feed URL (RSS/Atom)">
+      <input type="text" id="add-name" placeholder="Source name">
+      <button class="btn" onclick="addFeed()">Add Feed</button>
+    </div>
   </div>
 
   <div id="content"></div>
@@ -218,14 +331,19 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 </div>
 
 <script>
+var settingsVisible = false
+
+function toggleSettings() {
+  settingsVisible = !settingsVisible
+  document.getElementById("settings-panel").classList.toggle("visible", settingsVisible)
+  if (settingsVisible) loadSources()
+}
+
 function sourceChip(name) {
-  const map = {
-    "Simon Willison's Weblog": "simon",
-    "Hacker News": "hacker",
-    "MIT Technology Review": "mit",
-  }
-  const cls = map[name] || "default"
-  return '<span class="chip chip-' + cls + '">' + h(name) + '</span>'
+  var colors = ["#0984e3","#e17055","#00b894","#6c5ce7","#fdcb6e","#ff6600","#c41e3a","#2d3436"]
+  var hash = 0
+  for (var i = 0; i < name.length; i++) hash = ((hash << 5) - hash) + name.charCodeAt(i)
+  return '<span class="chip" style="background:' + colors[Math.abs(hash) % colors.length] + '">' + h(name) + '</span>'
 }
 
 function timeAgo(dateStr) {
@@ -285,6 +403,9 @@ function updateHeader(health) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Articles
+// ---------------------------------------------------------------------------
 async function loadArticles() {
   var content = document.getElementById("content")
   var btn = document.getElementById("refresh-btn")
@@ -310,6 +431,84 @@ async function loadArticles() {
     showError("Something went wrong: " + err.message)
   } finally {
     btn.disabled = false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sources CRUD
+// ---------------------------------------------------------------------------
+async function loadSources() {
+  try {
+    var resp = await fetch("/sources")
+    var sources = await resp.json()
+    if (sources.error) throw new Error(sources.error)
+    renderSourceList(sources)
+  } catch (err) {
+    showError("Failed to load sources: " + err.message)
+  }
+}
+
+function renderSourceList(sources) {
+  var el = document.getElementById("source-list")
+  if (sources.length === 0) {
+    el.innerHTML = '<p style="color:#888;font-size:13px;padding:12px 0;">No feeds configured. Add one below.</p>'
+    return
+  }
+  el.innerHTML = sources.map(function(s) {
+    return '<div class="source-row">' +
+      '<span class="source-name">' + h(s.name) + '</span>' +
+      '<span class="source-url">' + h(s.url) + '</span>' +
+      '<div class="toggle' + (s.enabled ? ' on' : '') + '" onclick="toggleSource(\'' + s.id + '\',' + s.enabled + ')" title="Enable/disable"></div>' +
+      '<button class="btn btn-danger btn-sm" onclick="deleteFeed(\'' + s.id + '\')">×</button>' +
+    '</div>'
+  }).join("")
+}
+
+async function addFeed() {
+  var urlEl = document.getElementById("add-url")
+  var nameEl = document.getElementById("add-name")
+  var url = urlEl.value.trim()
+  var name = nameEl.value.trim()
+  if (!url || !name) { showError("URL and name are required"); return }
+  dismissError()
+
+  try {
+    var resp = await fetch("/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: url, name: name })
+    })
+    if (!resp.ok) { var e = await resp.json(); throw new Error(e.error) }
+    urlEl.value = ""
+    nameEl.value = ""
+    loadSources()
+  } catch (err) {
+    showError("Failed to add feed: " + err.message)
+  }
+}
+
+async function toggleSource(id, current) {
+  try {
+    var resp = await fetch("/sources/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: current ? 0 : 1 })
+    })
+    if (!resp.ok) { var e = await resp.json(); throw new Error(e.error) }
+    loadSources()
+  } catch (err) {
+    showError("Failed to update feed: " + err.message)
+  }
+}
+
+async function deleteFeed(id) {
+  if (!confirm("Remove this feed?")) return
+  try {
+    var resp = await fetch("/sources/" + id, { method: "DELETE" })
+    if (!resp.ok) { var e = await resp.json(); throw new Error(e.error) }
+    loadSources()
+  } catch (err) {
+    showError("Failed to remove feed: " + err.message)
   }
 }
 

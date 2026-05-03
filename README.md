@@ -6,7 +6,7 @@ Runs on Cloudflare's free tier at $0/month.
 
 ## How it works
 
-Every 6 hours, a Cloudflare Worker fetches 3 configured RSS feeds, runs each
+Every 6 hours, a Cloudflare Worker fetches configured RSS feeds, runs each
 new article through Workers AI (Llama 4 Scout 17B), and stores a 2-3 sentence
 Chinese summary in D1. Deduplication via SHA-256 URL hashing. A single-page
 frontend displays the latest summaries.
@@ -14,10 +14,10 @@ frontend displays the latest summaries.
 ```
 RSS Feed 1 ─┐
 RSS Feed 2 ─┼─→ Worker (fetchAllFeeds) ─→ batchDedup ─→ Workers AI ─→ D1
-RSS Feed 3 ─┘                                              │
-                                                    Chinese summaries
-                                                           │
-                                                    GET / HTML frontend
+RSS Feed N ─┘        ▲                                       │
+                     │                                Chinese summaries
+            Sources stored in D1                              │
+            (CRUD via webapp/API)                      GET / HTML frontend
 ```
 
 ## Deploy
@@ -60,6 +60,10 @@ terraform apply
 | `GET /ingest` | Manually trigger multi-source ingestion. Returns `{processed, skipped, errors}` |
 | `GET /articles?limit=N` | JSON list of latest articles (default 20, max 100) |
 | `GET /health` | Database stats: `{count, last_ingestion}` |
+| `GET /sources` | List all feed sources (D1-backed, managed from webapp) |
+| `POST /sources` | Add a feed source (body: `{url, name}`) |
+| `PUT /sources/:id` | Update a feed source (partial update) |
+| `DELETE /sources/:id` | Delete a feed source |
 
 ## Configuration
 
@@ -70,7 +74,7 @@ terraform apply
 
 Change these in `worker/wrangler.toml` and re-deploy.
 
-To add or change RSS feeds, edit `worker/src/sources.ts` and re-deploy.
+To add or change RSS feeds, use the Feeds panel in the webapp or the `/sources` API — no redeploy needed. Feeds are stored in D1 and take effect on the next ingestion run.
 
 ## Project structure
 
@@ -81,9 +85,8 @@ terraform/           # D1 + Cron via Terraform
   outputs.tf
 worker/
   src/
-    index.ts         # Hono app + HTML frontend
-    ingest.ts        # Multi-source pipeline: fetch → dedup → summarize → store
-    sources.ts       # Feed source configuration
+    index.ts         # Hono app + HTML frontend (with settings panel)
+    ingest.ts        # Multi-source pipeline + D1-backed CRUD for sources
     prompt.ts        # Chinese summarization prompt
   eval/
     eval.ts          # Manual prompt quality evaluation
@@ -96,7 +99,7 @@ setup.sh             # One-command deploy (wrangler + terraform)
 
 ```bash
 cd worker
-npm test            # Run unit tests (vitest, 49 tests)
+npm test            # Run unit tests (vitest, 72 tests)
 npm run eval        # Manual prompt eval (requires CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)
 npm run build       # Build Worker bundle
 npm run deploy      # Deploy Worker
@@ -129,8 +132,8 @@ Breakeven is ~20 articles/day on the AI neuron budget.
 
 ## Roadmap
 
-- **v1.0.0** (now) — Multi-source pipeline, HTML frontend, published Terraform module, CI/CD
-- **v1.1.0** — Pluggable sources via Terraform variable, scoring/tagging/sentiment, multi-language support
+- **v1.0.0** (shipped) — Multi-source pipeline, HTML frontend, published Terraform module
+- **v1.1.0** (now) — D1-backed sources with webapp CRUD (add/remove feeds without redeploying), scoring/tagging
 - **v2.0.0** — Hosted SaaS platform with personalized digests
 
 ## License
