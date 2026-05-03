@@ -2,6 +2,7 @@ name = "edge-pulse"
 main = "src/index.ts"
 compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
+account_id = "344a7f7e7538e7460c83ad633a8bfe57"
 
 # D1 binding — for wrangler build only.
 # Terraform is authoritative for deployments.
@@ -9,7 +10,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "edge-pulse-db"
-database_id = "placeholder"
+database_id = "33b76fa5-4c9f-45e4-878f-a91870f0e7db"
 
 [ai]
 binding = "AI"

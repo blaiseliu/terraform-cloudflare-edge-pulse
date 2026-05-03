@@ -1,17 +1,11 @@
 import { extract } from "@extractus/feed-extractor"
 
-const FEED_URL = "https://simonwillison.net/atom/"
-const INIT_SQL = `CREATE TABLE IF NOT EXISTS articles (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    url TEXT UNIQUE NOT NULL,
-    source_name TEXT NOT NULL,
-    summary_zh TEXT,
-    published_at TEXT,
-    ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url);
-CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at);`
+const FEED_URL = "https://simonwillison.net/atom/everything/"
+const SCHEMA_SQL = [
+  "CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT UNIQUE NOT NULL, source_name TEXT NOT NULL, summary_zh TEXT, published_at TEXT, ingested_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url)",
+  "CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at)",
+]
 
 export interface Article {
   id: string
@@ -36,12 +30,15 @@ export async function sha256(text: string): Promise<string> {
     .join("")
 }
 
-export function stripHtml(html: string): string {
+export function stripHtml(html: unknown): string {
+  if (typeof html !== "string") return ""
   return html.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim()
 }
 
 export async function initSchema(db: D1Database): Promise<void> {
-  await db.exec(INIT_SQL)
+  for (const sql of SCHEMA_SQL) {
+    await db.prepare(sql).run()
+  }
 }
 
 export async function fetchAndParseFeed(): Promise<Article[]> {
@@ -52,14 +49,18 @@ export async function fetchAndParseFeed(): Promise<Article[]> {
     }),
   })
 
-  return (feed.entries || []).map((entry) => ({
-    id: "",
-    title: entry.title || "Untitled",
-    url: entry.link || "",
-    source: feed.title || "Unknown",
-    published: entry.published || null,
-    content: stripHtml(entry.description || ""),
-  })).filter((a) => a.url && a.title !== "Untitled")
+  return (feed.entries || []).map((entry) => {
+    const raw = (entry as any).description || entry.summary || ""
+    const desc = typeof raw === "string" ? raw : raw?.text || raw?.["#text"] || String(raw)
+    return {
+      id: "",
+      title: entry.title || "Untitled",
+      url: entry.link || "",
+      source: feed.title || "Unknown",
+      published: entry.published || null,
+      content: stripHtml(desc),
+    }
+  }).filter((a) => a.url && a.title !== "Untitled")
 }
 
 export async function summarize(

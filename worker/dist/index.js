@@ -8347,18 +8347,12 @@ var extract = /* @__PURE__ */ __name(async (url, options = {}, fetchOptions = {}
 }, "extract");
 
 // src/ingest.ts
-var FEED_URL = "https://simonwillison.net/atom/";
-var INIT_SQL = `CREATE TABLE IF NOT EXISTS articles (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    url TEXT UNIQUE NOT NULL,
-    source_name TEXT NOT NULL,
-    summary_zh TEXT,
-    published_at TEXT,
-    ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url);
-CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at);`;
+var FEED_URL = "https://simonwillison.net/atom/everything/";
+var SCHEMA_SQL = [
+  "CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT UNIQUE NOT NULL, source_name TEXT NOT NULL, summary_zh TEXT, published_at TEXT, ingested_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url)",
+  "CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at)"
+];
 async function sha256(text) {
   const data = new TextEncoder().encode(text);
   const hash2 = await crypto.subtle.digest("SHA-256", data);
@@ -8366,11 +8360,14 @@ async function sha256(text) {
 }
 __name(sha256, "sha256");
 function stripHtml(html) {
+  if (typeof html !== "string") return "";
   return html.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 }
 __name(stripHtml, "stripHtml");
 async function initSchema(db) {
-  await db.exec(INIT_SQL);
+  for (const sql of SCHEMA_SQL) {
+    await db.prepare(sql).run();
+  }
 }
 __name(initSchema, "initSchema");
 async function fetchAndParseFeed() {
@@ -8380,14 +8377,18 @@ async function fetchAndParseFeed() {
       description: entry.description || entry.summary || ""
     }), "getExtraEntryFields")
   });
-  return (feed.entries || []).map((entry) => ({
-    id: "",
-    title: entry.title || "Untitled",
-    url: entry.link || "",
-    source: feed.title || "Unknown",
-    published: entry.published || null,
-    content: stripHtml(entry.description || "")
-  })).filter((a) => a.url && a.title !== "Untitled");
+  return (feed.entries || []).map((entry) => {
+    const raw2 = entry.description || entry.summary || "";
+    const desc = typeof raw2 === "string" ? raw2 : raw2?.text || raw2?.["#text"] || String(raw2);
+    return {
+      id: "",
+      title: entry.title || "Untitled",
+      url: entry.link || "",
+      source: feed.title || "Unknown",
+      published: entry.published || null,
+      content: stripHtml(desc)
+    };
+  }).filter((a) => a.url && a.title !== "Untitled");
 }
 __name(fetchAndParseFeed, "fetchAndParseFeed");
 async function summarize(ai, model, title2, content, maxChars) {
@@ -8451,16 +8452,24 @@ __name(ingest, "ingest");
 var app = new Hono2();
 var schemaInitialized = false;
 app.get("/ingest", async (c) => {
-  if (!schemaInitialized) {
-    await initSchema(c.env.DB);
-    schemaInitialized = true;
+  try {
+    if (!schemaInitialized) {
+      await initSchema(c.env.DB);
+      schemaInitialized = true;
+    }
+    const maxChars = parseInt(c.env.MAX_CONTENT_CHARS || "2000", 10);
+    const result = await ingest(c.env.DB, c.env.AI, c.env.AI_MODEL, maxChars);
+    return c.json(result);
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
   }
-  const maxChars = parseInt(c.env.MAX_CONTENT_CHARS || "2000", 10);
-  const result = await ingest(c.env.DB, c.env.AI, c.env.AI_MODEL, maxChars);
-  return c.json(result);
 });
 app.get("/health", async (c) => {
   try {
+    if (!schemaInitialized) {
+      await initSchema(c.env.DB);
+      schemaInitialized = true;
+    }
     const { results } = await c.env.DB.prepare("SELECT COUNT(*) as count, MAX(ingested_at) as last_ingestion FROM articles").all();
     return c.json(results[0] || { count: 0, last_ingestion: null });
   } catch (err) {
