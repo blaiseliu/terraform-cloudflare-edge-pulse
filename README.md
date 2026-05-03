@@ -1,19 +1,23 @@
 # Edge-Pulse
 
-Automated AI content pipeline on Cloudflare — ingests RSS feeds, summarizes
-articles in Chinese using Workers AI, and stores results in D1. Runs on
-Cloudflare's free tier at $0/month.
+Automated AI content pipeline on Cloudflare — ingests multiple RSS feeds, summarizes
+articles in Chinese using Workers AI, stores results in D1, and serves a frontend.
+Runs on Cloudflare's free tier at $0/month.
 
 ## How it works
 
-Every 6 hours, a Cloudflare Worker fetches the configured RSS feed, runs each
-new article through Workers AI (Llama 4 Scout 17B), and stores a 2–3 sentence
-Chinese summary in D1. Deduplication via SHA-256 URL hashing.
+Every 6 hours, a Cloudflare Worker fetches 3 configured RSS feeds, runs each
+new article through Workers AI (Llama 4 Scout 17B), and stores a 2-3 sentence
+Chinese summary in D1. Deduplication via SHA-256 URL hashing. A single-page
+frontend displays the latest summaries.
 
 ```
-RSS Feed → Worker → Workers AI (LLaMA 4) → D1 Database
-                     ↓
-              Chinese summaries
+RSS Feed 1 ─┐
+RSS Feed 2 ─┼─→ Worker (fetchAllFeeds) ─→ batchDedup ─→ Workers AI ─→ D1
+RSS Feed 3 ─┘                                              │
+                                                    Chinese summaries
+                                                           │
+                                                    GET / HTML frontend
 ```
 
 ## Deploy
@@ -22,18 +26,28 @@ RSS Feed → Worker → Workers AI (LLaMA 4) → D1 Database
 D1:Edit, and Workers AI:Edit permissions.
 
 ```bash
-# 1. Install Worker dependencies and build
+# 1. Install Worker dependencies
 cd worker
 npm install
-npm run build
 
-# 2. Deploy the Worker
-export CLOUDFLARE_API_TOKEN="<your-token>"
+# 2. Run setup (deploys Worker, provisions D1 + Cron)
+cd ..
+./setup.sh
+```
+
+Setup runs `wrangler deploy` first (Worker must exist before the cron trigger),
+then `terraform apply` for D1 and cron infrastructure.
+
+Manual alternative (step by step):
+
+```bash
+cd worker
+npm install
 npx wrangler deploy
 
-# 3. Terraform provisions D1 + Cron (infrastructure only)
 cd ../terraform
 export TF_VAR_cloudflare_account_id="<your-account-id>"
+export CLOUDFLARE_API_TOKEN="<your-token>"
 terraform init
 terraform apply
 ```
@@ -42,7 +56,9 @@ terraform apply
 
 | Endpoint | Description |
 |---|---|
-| `GET /ingest` | Manually trigger ingestion. Returns `{processed, skipped, errors}` |
+| `GET /` | HTML frontend — browse articles with Chinese summaries |
+| `GET /ingest` | Manually trigger multi-source ingestion. Returns `{processed, skipped, errors}` |
+| `GET /articles?limit=N` | JSON list of latest articles (default 20, max 100) |
 | `GET /health` | Database stats: `{count, last_ingestion}` |
 
 ## Configuration
@@ -54,7 +70,7 @@ terraform apply
 
 Change these in `worker/wrangler.toml` and re-deploy.
 
-To change the RSS feed, edit `FEED_URL` in `worker/src/ingest.ts`.
+To add or change RSS feeds, edit `worker/src/sources.ts` and re-deploy.
 
 ## Project structure
 
@@ -65,20 +81,22 @@ terraform/           # D1 + Cron via Terraform
   outputs.tf
 worker/
   src/
-    index.ts         # Hono app entry point
-    ingest.ts        # Pipeline: fetch → summarize → store
+    index.ts         # Hono app + HTML frontend
+    ingest.ts        # Multi-source pipeline: fetch → dedup → summarize → store
+    sources.ts       # Feed source configuration
     prompt.ts        # Chinese summarization prompt
   eval/
     eval.ts          # Manual prompt quality evaluation
-  wrangler.toml      # Wrangler config (authoritative for deployments)
+  wrangler.toml      # Wrangler config (authoritative for Worker deployments)
   vitest.config.ts
+setup.sh             # One-command deploy (wrangler + terraform)
 ```
 
 ## Development
 
 ```bash
 cd worker
-npm test            # Run unit tests (vitest)
+npm test            # Run unit tests (vitest, 49 tests)
 npm run eval        # Manual prompt eval (requires CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)
 npm run build       # Build Worker bundle
 npm run deploy      # Deploy Worker
@@ -98,21 +116,21 @@ npm run eval -- --count=5  # Review 5 articles
 
 ## Free tier math
 
-| Resource | Free tier | Usage per article |
+| Resource | Free tier | Usage per batch |
 |---|---|---|
-| Worker requests | 100,000/day | 1 per batch |
+| Worker requests | 100,000/day | ~1 per batch + frontend views |
 | AI neurons | 10,000/day | ~500 per article |
 | D1 storage | 5 GB | ~1 KB per article |
 | D1 reads | 5M/day | ~1 per dedup check |
 | D1 writes | 100K/day | 1 per new article |
 
-At 15 articles/day (typical for a single feed), you stay well within the free tier.
+At 3 feeds producing ~45 articles/day, you stay well within the free tier.
 Breakeven is ~20 articles/day on the AI neuron budget.
 
 ## Roadmap
 
-- **v0.1.0** (now) — Single feed, Terraform provisioning, cron trigger
-- **v1.0.0** — Published Terraform module (registry.terraform.io), Pages frontend, pluggable sources
+- **v1.0.0** (now) — Multi-source pipeline, HTML frontend, published Terraform module, CI/CD
+- **v1.1.0** — Pluggable sources via Terraform variable, scoring/tagging/sentiment, multi-language support
 - **v2.0.0** — Hosted SaaS platform with personalized digests
 
 ## License

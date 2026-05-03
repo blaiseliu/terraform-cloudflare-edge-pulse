@@ -1,10 +1,16 @@
 import { extract } from "@extractus/feed-extractor"
+import type { SourceConfig } from "./sources"
+import { SOURCES } from "./sources"
 
-const FEED_URL = "https://simonwillison.net/atom/everything/"
 const SCHEMA_SQL = [
-  "CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT UNIQUE NOT NULL, source_name TEXT NOT NULL, summary_zh TEXT, published_at TEXT, ingested_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS articles (id TEXT PRIMARY KEY, title TEXT NOT NULL, url TEXT UNIQUE NOT NULL, source_name TEXT NOT NULL, feed_url TEXT, summary_zh TEXT, published_at TEXT, ingested_at TEXT NOT NULL DEFAULT (datetime('now')))",
   "CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url)",
   "CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at)",
+]
+
+const MIGRATION_SQL = [
+  "ALTER TABLE articles ADD COLUMN feed_url TEXT",
+  "CREATE INDEX IF NOT EXISTS idx_articles_feed_url ON articles(feed_url)",
 ]
 
 export interface Article {
@@ -12,6 +18,7 @@ export interface Article {
   title: string
   url: string
   source: string
+  feedUrl: string
   published: string | null
   content: string
 }
@@ -35,32 +42,86 @@ export function stripHtml(html: unknown): string {
   return html.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim()
 }
 
-export async function initSchema(db: D1Database): Promise<void> {
-  for (const sql of SCHEMA_SQL) {
-    await db.prepare(sql).run()
+let schemaReady: Promise<void> | null = null
+
+export async function ensureSchema(db: D1Database): Promise<void> {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      for (const sql of SCHEMA_SQL) {
+        await db.prepare(sql).run()
+      }
+      for (const sql of MIGRATION_SQL) {
+        try {
+          await db.prepare(sql).run()
+        } catch {
+          // Column already exists — ignore
+        }
+      }
+    })()
   }
+  return schemaReady
 }
 
-export async function fetchAndParseFeed(): Promise<Article[]> {
-  const feed = await extract(FEED_URL, {
+async function fetchFeed(source: SourceConfig): Promise<Article[]> {
+  const feed = await extract(source.url, {
     getExtraFeedFields: () => ({}),
     getExtraEntryFields: (entry) => ({
       description: entry.description || entry.summary || "",
     }),
   })
 
-  return (feed.entries || []).map((entry) => {
-    const raw = (entry as any).description || entry.summary || ""
-    const desc = typeof raw === "string" ? raw : raw?.text || raw?.["#text"] || String(raw)
-    return {
-      id: "",
-      title: entry.title || "Untitled",
-      url: entry.link || "",
-      source: feed.title || "Unknown",
-      published: entry.published || null,
-      content: stripHtml(desc),
-    }
-  }).filter((a) => a.url && a.title !== "Untitled")
+  return (feed.entries || [])
+    .map((entry) => {
+      const raw = (entry as any).description || entry.summary || ""
+      const desc =
+        typeof raw === "string" ? raw : raw?.text || raw?.["#text"] || String(raw)
+      return {
+        id: "",
+        title: entry.title || "Untitled",
+        url: entry.link || "",
+        source: source.name,
+        feedUrl: source.url,
+        published: entry.published || null,
+        content: stripHtml(desc),
+      }
+    })
+    .filter((a) => a.url && a.title !== "Untitled")
+}
+
+export async function fetchAllFeeds(
+  sources: SourceConfig[],
+): Promise<{ articles: Article[]; errors: string[] }> {
+  const errors: string[] = []
+
+  const results = await Promise.all(
+    sources.map(async (source) => {
+      try {
+        return await fetchFeed(source)
+      } catch (err) {
+        errors.push(`${source.name}: ${String(err)}`)
+        return []
+      }
+    }),
+  )
+
+  return { articles: results.flat(), errors }
+}
+
+export async function batchDedup(
+  db: D1Database,
+  articles: Article[],
+): Promise<Article[]> {
+  if (articles.length === 0) return []
+
+  const urls = articles.map((a) => a.url)
+  const placeholders = urls.map(() => "?").join(", ")
+  const { results } = await db
+    .prepare(`SELECT url FROM articles WHERE url IN (${placeholders})`)
+    .bind(...urls)
+    .all()
+
+  const existingUrls = new Set((results as { url: string }[]).map((r) => r.url))
+  return articles.filter((a) => !existingUrls.has(a.url))
 }
 
 export async function summarize(
@@ -86,6 +147,27 @@ export async function summarize(
   }
 }
 
+export async function summarizeAll(
+  ai: Ai,
+  model: string,
+  articles: Article[],
+  maxChars: number,
+): Promise<(Article & { summary: string | null })[]> {
+  const results = await Promise.all(
+    articles.map(async (article) => {
+      const summary = await summarize(
+        ai,
+        model,
+        article.title,
+        article.content,
+        maxChars,
+      )
+      return { ...article, summary }
+    }),
+  )
+  return results
+}
+
 export async function ingest(
   db: D1Database,
   ai: Ai,
@@ -94,42 +176,38 @@ export async function ingest(
 ): Promise<IngestResult> {
   const result: IngestResult = { processed: 0, skipped: 0, errors: [] }
 
-  let articles: Article[]
-  try {
-    articles = await fetchAndParseFeed()
-  } catch (err) {
-    result.errors.push(`Feed fetch failed: ${String(err)}`)
+  const { articles: fetched, errors: fetchErrors } = await fetchAllFeeds(SOURCES)
+  result.errors.push(...fetchErrors)
+
+  if (fetched.length === 0) {
+    if (result.errors.length === 0) {
+      result.errors.push("No articles fetched from any source")
+    }
     return result
   }
 
+  let newArticles: Article[]
+  try {
+    newArticles = await batchDedup(db, fetched)
+    result.skipped = fetched.length - newArticles.length
+  } catch (err) {
+    result.errors.push(`Dedup query failed: ${String(err)}`)
+    return result
+  }
+
+  if (newArticles.length === 0) return result
+
+  const summarized = await summarizeAll(ai, model, newArticles, maxChars)
+
   const stmts: D1PreparedStatement[] = []
-
-  for (const article of articles) {
+  for (const article of summarized) {
     const id = await sha256(article.url)
-
-    const { results } = await db
-      .prepare("SELECT id FROM articles WHERE id = ?")
-      .bind(id)
-      .all()
-
-    if (results.length > 0) {
-      result.skipped++
-      continue
-    }
-
-    let summary: string | null = null
-    try {
-      summary = await summarize(ai, model, article.title, article.content, maxChars)
-    } catch (err) {
-      result.errors.push(`Summarize failed for ${article.url}: ${String(err)}`)
-    }
-
     stmts.push(
       db
         .prepare(
-          "INSERT OR IGNORE INTO articles (id, title, url, source_name, summary_zh, published_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO articles (id, title, url, source_name, feed_url, summary_zh, published_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(id, article.title, article.url, article.source, summary, article.published),
+        .bind(id, article.title, article.url, article.source, article.feedUrl, article.summary, article.published),
     )
     result.processed++
   }
