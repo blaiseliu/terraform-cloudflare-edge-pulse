@@ -1,0 +1,19 @@
+name = "edge-pulse"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 binding — for wrangler build only.
+# Terraform is authoritative for deployments.
+# The database_id is a placeholder; wrangler build doesn't validate it.
+[[d1_databases]]
+binding = "DB"
+database_name = "edge-pulse-db"
+database_id = "placeholder"
+
+[ai]
+binding = "AI"
+
+[vars]
+AI_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct"
+MAX_CONTENT_CHARS = "2000"
